@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Distribution / packaging
+.eggs/
+*.egg-info/
+MANIFEST
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Fonts (copyrighted — provide your own; see README for search paths)
+arial.ttf
+*.ttf
+*.otf
+*.ttc
+
+# Generated output files
+cutsheet_*.svg
+*.svg
+
+# LibreOffice / spreadsheet sources
+*.ods
+*.xlsx
+*.xls
+
+# Jupyter / IPython
+.ipynb_checkpoints/

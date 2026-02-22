@@ -1,0 +1,7 @@
+# Required
+svgwrite>=1.4.3
+fonttools>=4.0.0
+
+# Optional: OR-Tools CP-SAT solver for optimal bin packing
+# Falls back to First-Fit Decreasing heuristic if not installed
+# ortools>=9.0
