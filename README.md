@@ -31,10 +31,102 @@ Python 3.8 or later is required.
 
 ## Installation
 
+### Windows (step-by-step)
+
+**1 — Install Python 3.8 or later**
+
+Download the installer from <https://www.python.org/downloads/windows/>.  
+During setup, tick **"Add Python to PATH"** before clicking *Install Now*.
+
+Verify in a new Command Prompt:
+```
+python --version
+```
+
+---
+
+**2 — Install Git** *(optional, for cloning)*
+
+Download the installer from <https://git-scm.com/download/win> and run it.  
+The default options are fine.  Verify in a new Command Prompt:
+```
+git --version
+```
+
+If you prefer not to install Git, skip this step and download the ZIP from GitHub instead (see step 3).
+
+---
+
+**3 — Download the project**
+
+Either clone with Git:
+```
+git clone https://github.com/<your-username>/lamicoid-generator.git
+cd "lamicoid-generator"
+```
+or download and extract the ZIP from GitHub, then open a Command Prompt in the extracted folder.
+
+---
+
+**4 — Create a virtual environment** *(recommended)*
+
+```
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+Your prompt will change to `(.venv) C:\…>` when the environment is active.  
+Run `.venv\Scripts\activate` again any time you open a new Command Prompt.
+
+---
+
+**5 — Install dependencies**
+
+```
+pip install svgwrite fonttools
+```
+
+Optional — for the optimal ILP solver (requires ~500 MB disk space):
+```
+pip install ortools
+```
+
+---
+
+**6 — Font** *(optional)*
+
+Arial is built into Windows and is found automatically at `C:\Windows\Fonts\arial.ttf`.  
+No extra steps are needed.
+
+---
+
+**7 — Test the installation**
+
+```
+python generator.py INPUT.csv 300 200 --solver ffd
+```
+
+You should see SVG files created in the current folder without any error messages.
+
+---
+
+**Deactivate the environment** when you are done:
+```
+deactivate
+```
+
+---
+
+### Linux / macOS
+
 ```bash
 # Clone the repository
 git clone https://github.com/<your-username>/lamicoid-generator.git
 cd lamicoid-generator
+
+# Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
 
 # Install dependencies
 pip install svgwrite fonttools
@@ -75,7 +167,7 @@ python generator.py INPUT.csv SHEET_WIDTH SHEET_HEIGHT [options]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-o`, `--output PREFIX` | `cutsheet` | Output filename prefix |
+| `-o`, `--output PREFIX` | `output/cutsheet` | Output path prefix, including optional directory (created automatically) |
 | `--solver {ilp,ffd}` | `ilp` | Solver: `ilp` = OR-Tools CP-SAT (optimal), `ffd` = First-Fit Decreasing (fast) |
 | `--time-limit SECONDS` | `60` | CP-SAT time limit per material group (ILP only) |
 
@@ -85,8 +177,8 @@ python generator.py INPUT.csv SHEET_WIDTH SHEET_HEIGHT [options]
 # Basic usage — 300 × 200 mm sheets, ILP solver
 python generator.py INPUT.csv 300 200
 
-# Custom output prefix
-python generator.py INPUT.csv 800 600 -o my_project
+# Custom output directory and prefix
+python generator.py INPUT.csv 800 600 -o my_project/cutsheet
 
 # Fast heuristic (no OR-Tools required)
 python generator.py INPUT.csv 300 200 --solver ffd
@@ -95,13 +187,13 @@ python generator.py INPUT.csv 300 200 --solver ffd
 python generator.py INPUT.csv 300 200 --time-limit 120
 ```
 
-Output SVG files are named `<prefix>_<material>_<sheet_number>.svg`, e.g. `cutsheet_ABS_WHITE_1.svg`.
+Output SVG files are named `<prefix>_<material>_<sheet_number>.svg`, e.g. `output/cutsheet_ABS_WHITE_1.svg`.  The output directory is created automatically if it does not exist.
 
 ---
 
 ## CSV Format
 
-The input file must be **semicolon-delimited** (`; `) with a header row and UTF-8 encoding. Fields may be quoted with double quotes.
+The input file must have a **header row** and **UTF-8 encoding**.  The delimiter (`,`, `;`, `\t`, or `|`) and quote character are detected automatically.  Semicolon-delimited files with double-quote quoting (the default export format of most European spreadsheet applications) are fully supported.
 
 ```
 "QUANTITY";"MATERIAL";"TEXTDATA";"LABEL WIDTH(mm)";"LABEL HEIGHT(mm)";"TEXT HEIGHT(mm)"

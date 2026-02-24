@@ -40,6 +40,7 @@ Dependencies
 
 import csv
 import math
+import os
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from collections import defaultdict
@@ -784,7 +785,12 @@ class ILPBinPacker:
 
 def parse_csv(filename: str) -> List[Label]:
     """
-    Parse a semicolon-delimited CSV file into Label objects.
+    Parse a CSV file into Label objects.
+
+    The delimiter and quote character are detected automatically via
+    ``csv.Sniffer``.  If sniffing fails the function falls back to
+    semicolons (;) with double-quote (") quoting, which is the format
+    produced by most European spreadsheet applications.
 
     The CSV must have a header row with at least the following columns
     (aliases accepted, case-insensitive):
@@ -813,12 +819,30 @@ def parse_csv(filename: str) -> List[Label]:
     required columns are absent.
     """
     labels = []
-    
+
     with open(filename, 'r', encoding='utf-8') as f:
-        # Use csv.reader with proper quoting and delimiter
-        reader = csv.reader(f, delimiter=';', quotechar='"', 
-                          quoting=csv.QUOTE_ALL,
-                          skipinitialspace=True)
+        # ── Auto-detect dialect ───────────────────────────────────────
+        sample = f.read(4096)
+        f.seek(0)
+        delimiter = ';'
+        quotechar = '"'
+        try:
+            detected = csv.Sniffer().sniff(sample, delimiters=',;\t|')
+            delimiter = detected.delimiter
+            quotechar = detected.quotechar or '"'
+            print(f"  → Detected CSV dialect: delimiter={delimiter!r} "
+                  f"quotechar={quotechar!r}")
+        except csv.Error:
+            reason = "file may be too short or ambiguous" if len(sample) < 512 else "content is ambiguous"
+            print(f"  ⚠️  Warning: CSV dialect detection failed ({reason}).")
+            print(f"  ↩  Falling back to default: delimiter={delimiter!r}  quotechar={quotechar!r}")
+            print(f"       If parsing fails, check that your CSV uses one of: , ; \\t |")
+
+        reader = csv.reader(f,
+                            delimiter=delimiter,
+                            quotechar=quotechar,
+                            doublequote=True,
+                            skipinitialspace=True)
         
         # Read header
         header = next(reader, None)
@@ -870,6 +894,9 @@ def parse_csv(filename: str) -> List[Label]:
                 quantity = int(row[indices['QUANTITY']].strip())
                 material = row[indices['MATERIAL']].strip()
                 textdata = row[indices['TEXTDATA']].strip()
+                # Normalise newlines: DOS \r\n → \n, then expand literal \n escape
+                textdata = textdata.replace('\r\n', '\n').replace('\r', '\n')
+                textdata = textdata.replace('\\n', '\n')
                 width = float(row[indices['WIDTH']].strip())
                 height = float(row[indices['HEIGHT']].strip())
                 text_height = float(row[indices['TEXT_HEIGHT']].strip())
@@ -1065,9 +1092,9 @@ class SVGGenerator:
         # Add cut lines group
         cut_lines_group = dwg.g(id='cut_lines')
         for cut_line in optimized_cut_lines:
-            cut_lines_group.add(dwg.rect(
-                insert=(cut_line['x'], cut_line['y']),
-                size=(cut_line['width'], cut_line['height']),
+            cut_lines_group.add(dwg.line(
+                start=(cut_line['x1'], cut_line['y1']),
+                end=(cut_line['x2'], cut_line['y2']),
                 class_='cut'
             ))
         dwg.add(cut_lines_group)
@@ -1186,12 +1213,12 @@ class SVGGenerator:
         cut_lines = []
         text_paths = []
         
-        # Cut line (treat as thin rectangle for optimization)
+        # Cut lines as true line segments (x1,y1 → x2,y2)
         cut_lines.extend([
-            {'x': x, 'y': y, 'width': width, 'height': 0.1, 'orientation': 'horizontal'},
-            {'x': x, 'y': y + height - 0.1, 'width': width, 'height': 0.1, 'orientation': 'horizontal'},
-            {'x': x, 'y': y, 'width': 0.1, 'height': height, 'orientation': 'vertical'},
-            {'x': x + width - 0.1, 'y': y, 'width': 0.1, 'height': height, 'orientation': 'vertical'}
+            {'x1': x,         'y1': y,          'x2': x + width,  'y2': y,          'orientation': 'horizontal'},  # top
+            {'x1': x,         'y1': y + height, 'x2': x + width,  'y2': y + height, 'orientation': 'horizontal'},  # bottom
+            {'x1': x,         'y1': y,          'x2': x,          'y2': y + height, 'orientation': 'vertical'},    # left
+            {'x1': x + width, 'y1': y,          'x2': x + width,  'y2': y + height, 'orientation': 'vertical'},    # right
         ])
         
         # Border rectangles
@@ -1202,10 +1229,33 @@ class SVGGenerator:
             {'x': x + width - self.BORDER_WIDTH, 'y': y, 'width': self.BORDER_WIDTH, 'height': height, 'orientation': 'vertical'}
         ])
         
-        # Convert text to paths
+        # Convert text to paths.
+        # For rotated labels the text is generated in the label's *original*
+        # (unrotated) coordinate frame, centred on the same point as the placed
+        # bounding box, and then an SVG rotate(90) transform is attached so the
+        # glyphs stay upright relative to the label face.
         if p.label.text:
-            text_paths.extend(self._text_to_paths(p.label.text, x, y, width, height, p.label.text_height))
-        
+            if p.rotation == 0:
+                text_paths.extend(
+                    self._text_to_paths(p.label.text, x, y, width, height,
+                                        p.label.text_height)
+                )
+            else:
+                # Centre of the placed (rotated) bounding box
+                cx = p.x + width  / 2   # width  = label.height after swap
+                cy = p.y + height / 2   # height = label.width  after swap
+                # Synthetic top-left of the *original* label rectangle,
+                # centred on (cx, cy) with original dimensions restored
+                x_orig = cx - p.label.width  / 2
+                y_orig = cy - p.label.height / 2
+                raw = self._text_to_paths(p.label.text,
+                                          x_orig, y_orig,
+                                          p.label.width, p.label.height,
+                                          p.label.text_height)
+                for tp in raw:
+                    tp['transform'] = f'rotate(90,{cx},{cy})'
+                text_paths.extend(raw)
+
         return borders, cut_lines, text_paths
     
     def _text_to_paths(self, text: str, x: float, y: float,
@@ -1738,22 +1788,85 @@ class SVGGenerator:
     
     def _optimize_cut_lines(self, cut_lines: list) -> list:
         """
-        Merge adjacent and collinear cut-line rectangles using the same
-        strategy as _optimize_rectangles.
+        Merge collinear, adjacent, or overlapping cut-line segments.
 
-        Cut lines are stored as very thin (0.1 mm) rectangles so they can
-        share the same merge infrastructure as border rectangles.
+        Horizontal segments sharing the same Y are merged when their X
+        ranges touch or overlap.  Vertical segments sharing the same X are
+        merged when their Y ranges touch or overlap.  The process repeats
+        until no further merges are possible.
 
         Parameters
         ----------
-        cut_lines : List of thin rect dicts (height or width ≈ 0.1 mm).
+        cut_lines : List of line dicts with keys x1, y1, x2, y2,
+                    orientation ('horizontal' | 'vertical').
 
         Returns
         -------
-        Reduced list of merged cut-line rect dicts.
+        Reduced list of merged line dicts.
         """
-        # Same logic as rectangles, but for cut lines
-        return self._optimize_rectangles(cut_lines)
+        if not cut_lines:
+            return []
+
+        TOLERANCE = 0.01  # mm
+
+        lines = [dict(l) for l in cut_lines]
+        merged_any = True
+        iteration = 0
+
+        while merged_any and iteration < 100:
+            merged_any = False
+            iteration += 1
+            new_lines = []
+            used = set()
+
+            for i, a in enumerate(lines):
+                if i in used:
+                    continue
+                merged = False
+                for j, b in enumerate(lines):
+                    if j <= i or j in used:
+                        continue
+                    if a['orientation'] != b['orientation']:
+                        continue
+                    if a['orientation'] == 'horizontal':
+                        # Same Y?
+                        if abs(a['y1'] - b['y1']) > TOLERANCE:
+                            continue
+                        # Ranges touch or overlap?
+                        a_min, a_max = min(a['x1'], a['x2']), max(a['x1'], a['x2'])
+                        b_min, b_max = min(b['x1'], b['x2']), max(b['x1'], b['x2'])
+                        if b_min <= a_max + TOLERANCE and b_max >= a_min - TOLERANCE:
+                            new_lines.append({
+                                'x1': min(a_min, b_min), 'y1': a['y1'],
+                                'x2': max(a_max, b_max), 'y2': a['y1'],
+                                'orientation': 'horizontal',
+                            })
+                            used.add(i); used.add(j)
+                            merged_any = merged = True
+                            break
+                    else:  # vertical
+                        # Same X?
+                        if abs(a['x1'] - b['x1']) > TOLERANCE:
+                            continue
+                        # Ranges touch or overlap?
+                        a_min, a_max = min(a['y1'], a['y2']), max(a['y1'], a['y2'])
+                        b_min, b_max = min(b['y1'], b['y2']), max(b['y1'], b['y2'])
+                        if b_min <= a_max + TOLERANCE and b_max >= a_min - TOLERANCE:
+                            new_lines.append({
+                                'x1': a['x1'], 'y1': min(a_min, b_min),
+                                'x2': a['x1'], 'y2': max(a_max, b_max),
+                                'orientation': 'vertical',
+                            })
+                            used.add(i); used.add(j)
+                            merged_any = merged = True
+                            break
+                if not merged and i not in used:
+                    new_lines.append(a)
+                    used.add(i)
+
+            lines = new_lines
+
+        return lines
 
 
 # ============================================================================
@@ -1761,7 +1874,7 @@ class SVGGenerator:
 # ============================================================================
 
 def generate_laser_sheets(csv_file: str, sheet_width: float, sheet_height: float,
-                         output_prefix: str = "cutsheet",
+                         output_prefix: str = "output/cutsheet",
                          solver: str = "ilp",
                          time_limit: int = 60) -> List[str]:
     """
@@ -1852,10 +1965,15 @@ def generate_laser_sheets(csv_file: str, sheet_width: float, sheet_height: float
         # Clean material name for filename
         material_clean = sheet.material.replace(' ', '_').replace('/', '_')
         filename = f"{output_prefix}_{material_clean}_{sheet_num}.svg"
-        
+
+        # Ensure output directory exists
+        out_dir = os.path.dirname(filename)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
         generator = SVGGenerator(sheet)
         svg_content = generator.generate()
-        
+
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(svg_content)
         
@@ -1918,8 +2036,10 @@ Output SVG layers:
     parser.add_argument("csv_file", help="Input CSV file path")
     parser.add_argument("width",  type=float, help="Sheet width in mm")
     parser.add_argument("height", type=float, help="Sheet height in mm")
-    parser.add_argument("-o", "--output", default="cutsheet",
-                        help="Output filename prefix (default: cutsheet)")
+    parser.add_argument("-o", "--output", default="output/cutsheet",
+                        help="Output path prefix, e.g. output/cutsheet "
+                             "(default: output/cutsheet). "
+                             "The directory is created automatically.")
     parser.add_argument("--solver", choices=["ilp", "ffd"], default="ilp",
                         help="Solver: 'ilp' = OR-Tools CP-SAT (default), "
                              "'ffd' = First-Fit Decreasing heuristic")
