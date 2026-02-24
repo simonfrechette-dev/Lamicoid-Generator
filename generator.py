@@ -9,9 +9,10 @@ Architecture
   parse_csv()          Read label definitions from a semicolon-delimited CSV.
   ILPBinPacker         Optimal 2-D bin packing via OR-Tools CP-SAT (default).
   SimpleBinPacker      Fast FFD heuristic fallback (no external dependencies).
-  SVGGenerator         Render a packed Sheet to an SVG with three named layers:
-                         borders   — amber 0.8 mm etched frame around each label
+  SVGGenerator         Render a packed Sheet to an SVG with three named layers
+                         (back to front):
                          cut_lines — red 0.1 mm cutting outline
+                         borders   — amber 0.8 mm etched frame around each label
                          text      — blue text converted to merged path outlines
 
 Usage
@@ -932,18 +933,22 @@ class SVGGenerator:
     """
     Render a packed Sheet as an SVG file suitable for laser processing.
 
-    The generated SVG contains three named groups / layers:
+    The generated SVG contains three named groups / layers in draw order
+    (back to front):
 
     =========  =======  ================================================
     Group id   Colour   Purpose
     =========  =======  ================================================
+    cut_lines  red      0.1 mm stroke rectangle at each label boundary.
+                        Laser cuts along these lines.  (back layer)
     borders    amber    0.8 mm solid fill frame around each label.
                         Laser engraves the border decoration.
-    cut_lines  red      0.1 mm stroke rectangle at each label boundary.
-                        Laser cuts along these lines.
     text       blue     Label text converted to filled path outlines.
-                        Laser engraves the text shapes.
+                        Laser engraves the text shapes.  (front layer)
     =========  =======  ================================================
+
+    Within each group elements are ordered by coordinate position
+    (top-to-bottom, then left-to-right).
 
     Adjacent/touching/overlapping rectangles in the borders and cut_lines
     groups are merged before output to reduce the total path count and
@@ -1067,6 +1072,9 @@ class SVGGenerator:
             borders, cut_lines, text_paths = self._extract_placement_elements(placement, i)
             all_borders.extend(borders)
             all_cut_lines.extend(cut_lines)
+            for tp in text_paths:
+                tp['_sort_y'] = placement.y
+                tp['_sort_x'] = placement.x
             all_text_paths.extend(text_paths)
         
         # Optimize borders and cut lines
@@ -1078,18 +1086,13 @@ class SVGGenerator:
         
         print(f"     After:  {len(optimized_borders)} border rectangles, {len(optimized_cut_lines)} cut lines")
         print(f"     Text:   {len(all_text_paths)} text paths generated (one path per label)")
-        
-        # Add borders group
-        borders_group = dwg.g(id='borders')
-        for border in optimized_borders:
-            borders_group.add(dwg.rect(
-                insert=(border['x'], border['y']),
-                size=(border['width'], border['height']),
-                class_='engrave'
-            ))
-        dwg.add(borders_group)
-        
-        # Add cut lines group
+
+        # Sort each group by coordinates (top-to-bottom, left-to-right)
+        optimized_borders.sort(key=lambda r: (r['y'], r['x']))
+        optimized_cut_lines.sort(key=lambda l: (min(l['y1'], l['y2']), min(l['x1'], l['x2'])))
+        all_text_paths.sort(key=lambda tp: (tp.get('_sort_y', 0), tp.get('_sort_x', 0)))
+
+        # Add cut lines group (back layer)
         cut_lines_group = dwg.g(id='cut_lines')
         for cut_line in optimized_cut_lines:
             cut_lines_group.add(dwg.line(
@@ -1098,8 +1101,18 @@ class SVGGenerator:
                 class_='cut'
             ))
         dwg.add(cut_lines_group)
-        
-        # Add text paths group
+
+        # Add borders group (middle layer)
+        borders_group = dwg.g(id='borders')
+        for border in optimized_borders:
+            borders_group.add(dwg.rect(
+                insert=(border['x'], border['y']),
+                size=(border['width'], border['height']),
+                class_='engrave'
+            ))
+        dwg.add(borders_group)
+
+        # Add text paths group (front layer)
         text_group = dwg.g(id='text')
         for text_path_data in all_text_paths:
             if text_path_data and text_path_data.get('d'):
