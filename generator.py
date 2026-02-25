@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026  Lesco Design & Mfg. Co., Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 Laser Cut Sheet Optimizer — ILP/FFD 2-D Bin Packing + SVG Output
 =================================================================
@@ -39,12 +53,96 @@ Dependencies
     Optional : ortools  (ILP solver; falls back to FFD if absent)
 """
 
+import configparser
 import csv
 import math
 import os
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from collections import defaultdict
+
+try:
+    from ortools.sat.python import cp_model
+except ImportError:
+    cp_model = None
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+_CONF_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'generator.conf')
+
+# System font search paths keyed by font name (lower-case, no extension).
+# Each entry is a list of candidate paths tried in order.
+_FONT_PATHS: Dict[str, List[str]] = {
+    'arial': [
+        'arial.ttf',
+        'C:\\Windows\\Fonts\\arial.ttf',
+        '/System/Library/Fonts/Arial.ttf',
+        '/usr/share/fonts/truetype/msttcorefonts/Arial.ttf',
+    ],
+    'liberationsans': [
+        '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+    ],
+    'dejavusans': [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    ],
+    'helvetica': [
+        '/System/Library/Fonts/Helvetica.ttc',
+    ],
+}
+
+# Generic fallback list when the configured font is not found
+_FONT_FALLBACK = [
+    'arial.ttf',
+    'C:\\Windows\\Fonts\\arial.ttf',
+    '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    '/System/Library/Fonts/Helvetica.ttc',
+]
+
+
+def load_config(conf_path: str = _CONF_FILE) -> configparser.ConfigParser:
+    """
+    Load settings from *conf_path* (INI format).
+
+    Missing file or missing keys are silently handled — the returned
+    ConfigParser object always has a complete ``[DEFAULT]`` section
+    so callers can use ``cfg.get(section, key)`` without guarding.
+
+    Parameters
+    ----------
+    conf_path : Path to the ``.conf`` file.  Defaults to
+                ``generator.conf`` next to the script.
+
+    Returns
+    -------
+    Populated ConfigParser instance.
+    """
+    defaults = {
+        'cut':          '#f44336',
+        'engrave':      '#ffc107',
+        'text':         '#0000ff',
+        'border_width': '0.8',
+        'text_margin':  '1.0',
+        'width':        '300',
+        'height':       '200',
+        'name':         'Arial',
+    }
+    cfg = configparser.ConfigParser(defaults=defaults)
+    if os.path.exists(conf_path):
+        cfg.read(conf_path, encoding='utf-8')
+        print(f"  → Configuration loaded from: {conf_path}")
+    else:
+        print(f"  ⚠️  Config file not found ({conf_path}), using built-in defaults.")
+    # Ensure expected sections exist so callers can always access them
+    for section in ('colors', 'dimensions', 'sheet', 'font'):
+        if not cfg.has_section(section):
+            cfg.add_section(section)
+    return cfg
+
+
+CFG: configparser.ConfigParser = load_config()
 
 # ============================================================================
 # DATA STRUCTURES
@@ -347,15 +445,15 @@ class SimpleBinPacker:
         [(0, 0)] when the sheet is empty.
         """
         if not sheet.placements:
-            return [(0, 0)]
+            return [(0.0, 0.0)]
         
         # Simple approach: check grid positions
-        skyline = [(0, 0)]
+        skyline: List[Tuple[float, float]] = [(0.0, 0.0)]
         
         # Add positions after each placement
         for p in sheet.placements:
             w = p.label.width if p.rotation == 0 else p.label.height
-            skyline.append((p.x + w, 0))
+            skyline.append((p.x + w, 0.0))
         
         # Sort and deduplicate
         skyline = sorted(set(skyline))
@@ -563,8 +661,14 @@ class ILPBinPacker:
         -------
         List of Sheet objects with ILP-optimal (or FFD-fallback) placements.
         """
-        from ortools.sat.python import cp_model
-
+        if cp_model is None:
+            print("  ⚠️  OR-Tools not available.  Falling back to FFD heuristic")
+            return SimpleBinPacker(self.sheet_width, self.sheet_height) \
+                       ._pack_material(labels, material)
+        
+        # Import here to narrow the type for type checkers
+        from ortools.sat.python import cp_model as cp_model_module
+        
         S = self.SCALE
         W = int(round(self.sheet_width  * S))
         H = int(round(self.sheet_height * S))
@@ -598,12 +702,13 @@ class ILPBinPacker:
         print(f"  → FFD upper bound: {ub} sheet(s)")
 
         # ── Build CP-SAT model ────────────────────────────────────────
-        model = cp_model.CpModel()
+        model = cp_model_module.CpModel()
 
         # Variable containers
-        a_var: Dict[Tuple, object] = {}   # (i, k, oi) -> BoolVar
-        x_var: Dict[Tuple, object] = {}   # (i, k, oi) -> IntVar
-        y_var: Dict[Tuple, object] = {}   # (i, k, oi) -> IntVar
+        from ortools.sat.python.cp_model import BoolVarT, IntVar as CpIntVar
+        a_var: Dict[Tuple, BoolVarT] = {}   # (i, k, oi) -> BoolVar
+        x_var: Dict[Tuple, CpIntVar] = {}   # (i, k, oi) -> IntVar
+        y_var: Dict[Tuple, CpIntVar] = {}   # (i, k, oi) -> IntVar
         # Per-sheet interval lists for AddNoOverlap2D
         x_itvs = [[] for _ in range(ub)]
         y_itvs = [[] for _ in range(ub)]
@@ -612,13 +717,13 @@ class ILPBinPacker:
             for k in range(ub):
                 for oi, (w, h, _) in enumerate(item['oris']):
                     key = (i, k, oi)
-                    a = model.NewBoolVar(f'a_{i}_{k}_{oi}')
-                    x = model.NewIntVar(0, W - w, f'x_{i}_{k}_{oi}')
-                    y = model.NewIntVar(0, H - h, f'y_{i}_{k}_{oi}')
-                    xi = model.NewOptionalIntervalVar(x, w, x + w, a,
-                                                     f'xi_{i}_{k}_{oi}')
-                    yi = model.NewOptionalIntervalVar(y, h, y + h, a,
-                                                     f'yi_{i}_{k}_{oi}')
+                    a = model.new_bool_var(f'a_{i}_{k}_{oi}')
+                    x = model.new_int_var(0, W - w, f'x_{i}_{k}_{oi}')
+                    y = model.new_int_var(0, H - h, f'y_{i}_{k}_{oi}')
+                    xi = model.new_optional_interval_var(x, w, x + w, a,
+                                                        f'xi_{i}_{k}_{oi}')
+                    yi = model.new_optional_interval_var(y, h, y + h, a,
+                                                        f'yi_{i}_{k}_{oi}')
                     a_var[key] = a
                     x_var[key] = x
                     y_var[key] = y
@@ -630,32 +735,32 @@ class ILPBinPacker:
             once = [a_var[(i, k, oi)]
                     for k in range(ub)
                     for oi in range(len(item['oris']))]
-            model.AddExactlyOne(once)
+            model.add_exactly_one(*once)
 
         # Constraint 2 — no overlap per sheet
         for k in range(ub):
-            model.AddNoOverlap2D(x_itvs[k], y_itvs[k])
+            model.add_no_overlap_2d(x_itvs[k], y_itvs[k])
 
         # Constraint 3 — sheet usage indicator
-        sheet_used = [model.NewBoolVar(f'su_{k}') for k in range(ub)]
+        sheet_used = [model.new_bool_var(f'su_{k}') for k in range(ub)]
         for k in range(ub):
             for i, item in enumerate(items):
                 for oi in range(len(item['oris'])):
-                    model.Add(sheet_used[k] >= a_var[(i, k, oi)])
+                    model.add(sheet_used[k] >= a_var[(i, k, oi)])
 
         # Constraint 4 — symmetry breaking (packed sheets are contiguous)
         for k in range(ub - 1):
-            model.Add(sheet_used[k] >= sheet_used[k + 1])
+            model.add(sheet_used[k] >= sheet_used[k + 1])
 
         # Objective
-        model.Minimize(sum(sheet_used))
+        model.minimize(sum(sheet_used))
 
         # ── Warm-start hints from FFD ──────────────────────────────────
         self._add_ffd_hints(model, ffd_sheets, items, a_var, x_var, y_var,
                             sheet_used, S)
 
         # ── Solve ─────────────────────────────────────────────────────
-        solver = cp_model.CpSolver()
+        solver = cp_model_module.CpSolver()
         solver.parameters.max_time_in_seconds  = self.time_limit
         solver.parameters.num_workers          = 8
         solver.parameters.log_search_progress  = False
@@ -663,11 +768,11 @@ class ILPBinPacker:
         status = solver.Solve(model)
         status_name = solver.StatusName(status)
 
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            n_used = int(round(solver.ObjectiveValue()))
-            optimality = "optimal" if status == cp_model.OPTIMAL else "feasible"
+        if status in (cp_model_module.OPTIMAL, cp_model_module.FEASIBLE):
+            n_used = int(round(solver.objective_value))
+            optimality = "optimal" if status == cp_model_module.OPTIMAL else "feasible"
             print(f"  → ILP solution: {n_used} sheet(s) "
-                  f"[{optimality}] in {solver.WallTime():.1f}s")
+                  f"[{optimality}] in {solver.wall_time:.1f}s")
             return self._extract_sheets(solver, items, a_var, x_var, y_var,
                                         ub, material, S)
         else:
@@ -958,20 +1063,23 @@ class SVGGenerator:
     can be located, otherwise falls back to placeholder rectangles.
     """
     
-    # Colors
-    COLOR_CUT = "#f44336"      # Red for cutting
-    COLOR_ENGRAVE = "#ffc107"   # Amber for engraving (border)
-    COLOR_TEXT = "#0000ff"      # Blue for text
-    BORDER_WIDTH = 0.8          # mm - border etching width
-    
-    def __init__(self, sheet: Sheet) -> None:
+    def __init__(self, sheet: Sheet, cfg: Optional[configparser.ConfigParser] = None) -> None:
         """
         Prepare the generator for a specific sheet.
 
         Parameters
         ----------
         sheet : The Sheet (with all Placements) to render.
+        cfg   : ConfigParser instance (defaults to the module-level ``CFG``).
         """
+        if cfg is None:
+            cfg = CFG
+        self.COLOR_CUT     = cfg.get('colors',     'cut')
+        self.COLOR_ENGRAVE = cfg.get('colors',     'engrave')
+        self.COLOR_TEXT    = cfg.get('colors',     'text')
+        self.BORDER_WIDTH  = cfg.getfloat('dimensions', 'border_width')
+        self.TEXT_MARGIN   = cfg.getfloat('dimensions', 'text_margin')
+        self._font_name    = cfg.get('font', 'name').strip()
         self.sheet = sheet
         self._init_font()
         
@@ -994,33 +1102,45 @@ class SVGGenerator:
         """
         try:
             from fontTools.ttLib import TTFont
-            import os
-            
-            # Try to load Arial font
-            font_paths = [
-                'arial.ttf',
-                '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
-                '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-                '/System/Library/Fonts/Helvetica.ttc',
-                'C:\\Windows\\Fonts\\arial.ttf',
-            ]
-            
+
             self.font = None
             self.font_path = None
-            
-            for font_path in font_paths:
-                if os.path.exists(font_path):
+
+            # Build candidate list:
+            # 1. Paths derived from the configured font name
+            # 2. Generic system-font fallback list
+            key = self._font_name.lower().replace(' ', '')
+            name_lower = self._font_name.lower()
+            candidates = list(_FONT_PATHS.get(key, [])) + [
+                # Try the name directly as a filename in CWD
+                f"{self._font_name}.ttf",
+                f"{self._font_name}.otf",
+                f"{name_lower}.ttf",
+                f"{name_lower}.otf",
+                # Windows system fonts
+                f"C:\\Windows\\Fonts\\{name_lower}.ttf",
+                f"C:\\Windows\\Fonts\\{name_lower}.otf",
+                # macOS
+                f"/Library/Fonts/{self._font_name}.ttf",
+                f"/System/Library/Fonts/{self._font_name}.ttf",
+                # Linux
+                f"/usr/share/fonts/truetype/{name_lower}/{name_lower}.ttf",
+            ] + _FONT_FALLBACK
+
+            for font_path in candidates:
+                if font_path and os.path.exists(font_path):
                     try:
                         self.font = TTFont(font_path)
                         self.font_path = font_path
                         print(f"  → Loaded font: {font_path}")
                         break
-                    except Exception as e:
+                    except Exception:
                         continue
-            
+
             if not self.font:
-                print(f"  ⚠️  Warning: No suitable font found, text will use fallback rendering")
-                
+                print(f"  ⚠️  Warning: Font '{self._font_name}' not found, "
+                      f"text will use fallback rendering")
+
         except ImportError:
             print(f"  ⚠️  Warning: fontTools not installed. Install with: pip install fonttools")
             self.font = None
@@ -1308,6 +1428,54 @@ class SVGGenerator:
             return []
         
         num_lines = len(text_lines)
+
+        # ── Validate text fits with required margin from borders ───────
+        inner_margin = self.BORDER_WIDTH + self.TEXT_MARGIN  # total clearance from label edge
+        available_width  = width  - 2 * inner_margin
+        available_height = height - 2 * inner_margin
+
+        if available_width <= 0 or available_height <= 0:
+            label_preview = text.replace('\n', '↵')[:30]
+            print(f"  ⚠️  Label '{label_preview}' ({width:.1f}×{height:.1f}mm) is too small "
+                  f"for text with {self.TEXT_MARGIN}mm margin — text skipped.")
+            return []
+
+        adjusted_text_height = text_height
+        reasons = []
+
+        # Vertical check
+        total_text_height_check = (num_lines - 1) * adjusted_text_height * 1.2 + adjusted_text_height
+        if total_text_height_check > available_height:
+            new_h = available_height / ((num_lines - 1) * 1.2 + 1)
+            reasons.append(
+                f"text block height {total_text_height_check:.2f}mm exceeds available "
+                f"{available_height:.2f}mm (label height {height:.2f}mm)"
+            )
+            adjusted_text_height = new_h
+
+        # Horizontal check (using already-adjusted height)
+        max_line_width = max(
+            self._measure_text_line_width(line.strip(), adjusted_text_height)
+            for line in text_lines
+        )
+        if max_line_width > available_width:
+            scale_h = available_width / max_line_width
+            new_h = adjusted_text_height * scale_h
+            reasons.append(
+                f"text line width {max_line_width:.2f}mm exceeds available "
+                f"{available_width:.2f}mm (label width {width:.2f}mm)"
+            )
+            adjusted_text_height = new_h
+
+        if reasons:
+            label_preview = text.replace('\n', '↵')[:30]
+            print(f"  ⚠️  Text height adjusted on label '{label_preview}': "
+                  f"{text_height:.2f}mm → {adjusted_text_height:.2f}mm")
+            for reason in reasons:
+                print(f"       Reason: {reason}")
+            text_height = adjusted_text_height
+        # ─────────────────────────────────────────────────────────────
+
         line_height = text_height * 1.2
         total_text_height = (num_lines - 1) * line_height + text_height
         start_y = y + (height - total_text_height) / 2
@@ -1371,7 +1539,7 @@ class SVGGenerator:
             from fontTools.pens.transformPen import TransformPen
             
             # Get font metrics
-            units_per_em = self.font['head'].unitsPerEm
+            units_per_em = getattr(self.font['head'], 'unitsPerEm', 1000)
             scale = size / units_per_em
             
             # Get character map
@@ -1482,7 +1650,55 @@ class SVGGenerator:
             }]
         
         return []
-    
+
+    def _measure_text_line_width(self, text: str, size: float) -> float:
+        """
+        Estimate the rendered width of a single text line at *size* mm.
+
+        Uses the loaded TrueType font (same path as _create_text_path) when
+        available, otherwise falls back to the monospaced rectangle estimate
+        used by _create_fallback_text_path.
+
+        Parameters
+        ----------
+        text : Single line of text (no newlines).
+        size : Target em/cap-height in mm.
+
+        Returns
+        -------
+        Estimated rendered width in mm.
+        """
+        if not text:
+            return 0.0
+
+        if not self.font:
+            # Matches _create_fallback_text_path geometry
+            char_width = size * 0.6
+            spacing    = size * 0.1
+            return len(text) * (char_width + spacing) - spacing
+
+        try:
+            units_per_em = getattr(self.font['head'], 'unitsPerEm', 1000)
+            scale = size / units_per_em
+            cmap  = self.font.getBestCmap()
+            if not cmap:
+                char_width = size * 0.6
+                spacing    = size * 0.1
+                return len(text) * (char_width + spacing) - spacing
+            glyph_set   = self.font.getGlyphSet()
+            total_width = 0.0
+            for char in text:
+                glyph_name = cmap.get(ord(char))
+                if glyph_name and glyph_name in glyph_set:
+                    total_width += glyph_set[glyph_name].width * scale
+                else:
+                    total_width += size * 0.5
+            return total_width
+        except Exception:
+            char_width = size * 0.6
+            spacing    = size * 0.1
+            return len(text) * (char_width + spacing) - spacing
+
     def _optimize_rectangles(self, rectangles: list) -> list:
         """
         Iteratively merge a list of axis-aligned rectangles until stable.
@@ -2046,9 +2262,14 @@ Output SVG layers:
         """
     )
 
+    _default_w = CFG.getfloat('sheet', 'width')
+    _default_h = CFG.getfloat('sheet', 'height')
+
     parser.add_argument("csv_file", help="Input CSV file path")
-    parser.add_argument("width",  type=float, help="Sheet width in mm")
-    parser.add_argument("height", type=float, help="Sheet height in mm")
+    parser.add_argument("width",  type=float, nargs='?', default=_default_w,
+                        help=f"Sheet width in mm (default from config: {_default_w})")
+    parser.add_argument("height", type=float, nargs='?', default=_default_h,
+                        help=f"Sheet height in mm (default from config: {_default_h})")
     parser.add_argument("-o", "--output", default="output/cutsheet",
                         help="Output path prefix, e.g. output/cutsheet "
                              "(default: output/cutsheet). "

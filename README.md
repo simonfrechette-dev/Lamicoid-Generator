@@ -83,7 +83,7 @@ Run `.venv\Scripts\activate` again any time you open a new Command Prompt.
 **5 — Install dependencies**
 
 ```
-pip install svgwrite fonttools
+pip install -r requirements.txt
 ```
 
 Optional — for the optimal ILP solver (requires ~500 MB disk space):
@@ -103,10 +103,10 @@ No extra steps are needed.
 **7 — Test the installation**
 
 ```
-python generator.py INPUT.csv 300 200 --solver ffd
+python generator.py INPUT.csv --solver ffd
 ```
 
-You should see SVG files created in the current folder without any error messages.
+You should see SVG files created in the `output/` folder without any error messages.  Sheet dimensions default to the values in `generator.conf` (300 × 200 mm).
 
 ---
 
@@ -129,7 +129,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
-pip install svgwrite fonttools
+pip install -r requirements.txt
 
 # Optional: install OR-Tools for optimal bin packing
 pip install ortools
@@ -137,13 +137,14 @@ pip install ortools
 
 ### Font
 
-The generator looks for a TrueType font in the following locations (in order):
+The font is configured via `[font] name` in `generator.conf` (default: `Arial`).  For each run the generator builds a candidate list and accepts the first path that exists:
 
-1. `arial.ttf` in the current working directory
-2. `/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf` (Linux)
-3. `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` (Linux)
-4. `/System/Library/Fonts/Helvetica.ttc` (macOS)
-5. `C:\Windows\Fonts\arial.ttf` (Windows)
+1. Known system paths for the configured font name (Windows, macOS, Linux variants)
+2. `<FontName>.ttf` / `<FontName>.otf` in the current working directory
+3. `C:\Windows\Fonts\<name>.ttf` (Windows)
+4. `/Library/Fonts/<name>.ttf` / `/System/Library/Fonts/<name>.ttf` (macOS)
+5. `/usr/share/fonts/truetype/<name>/<name>.ttf` (Linux)
+6. Generic fallback list: `arial.ttf` (CWD) → `C:\Windows\Fonts\arial.ttf` → LiberationSans (Linux) → DejaVuSans (Linux) → `Helvetica.ttc` (macOS)
 
 If no font is found, text is rendered as placeholder rectangles.
 
@@ -152,7 +153,7 @@ If no font is found, text is rendered as placeholder rectangles.
 ## Usage
 
 ```
-python generator.py INPUT.csv SHEET_WIDTH SHEET_HEIGHT [options]
+python generator.py INPUT.csv [SHEET_WIDTH [SHEET_HEIGHT]] [options]
 ```
 
 ### Positional arguments
@@ -160,8 +161,8 @@ python generator.py INPUT.csv SHEET_WIDTH SHEET_HEIGHT [options]
 | Argument | Description |
 |----------|-------------|
 | `INPUT.csv` | Path to the label definitions CSV |
-| `SHEET_WIDTH` | Stock sheet width in mm |
-| `SHEET_HEIGHT` | Stock sheet height in mm |
+| `SHEET_WIDTH` | Stock sheet width in mm (optional — defaults to `[sheet] width` in `generator.conf`, factory default 300) |
+| `SHEET_HEIGHT` | Stock sheet height in mm (optional — defaults to `[sheet] height` in `generator.conf`, factory default 200) |
 
 ### Options
 
@@ -174,14 +175,17 @@ python generator.py INPUT.csv SHEET_WIDTH SHEET_HEIGHT [options]
 ### Examples
 
 ```bash
-# Basic usage — 300 × 200 mm sheets, ILP solver
+# Basic usage — sheet size from generator.conf, ILP solver
+python generator.py INPUT.csv
+
+# Explicit sheet size
 python generator.py INPUT.csv 300 200
 
 # Custom output directory and prefix
 python generator.py INPUT.csv 800 600 -o my_project/cutsheet
 
 # Fast heuristic (no OR-Tools required)
-python generator.py INPUT.csv 300 200 --solver ffd
+python generator.py INPUT.csv --solver ffd
 
 # Allow 2 minutes for the ILP solver per material group
 python generator.py INPUT.csv 300 200 --time-limit 120
@@ -250,17 +254,45 @@ Text is rendered by walking each character through the font's glyph set via font
 
 ---
 
+## Configuration
+
+All tuneable parameters live in `generator.conf` (INI format) next to the script.  The file is optional — missing keys revert to built-in defaults.
+
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `[colors]` | `cut` | `#f44336` | SVG colour for the laser-cutting path |
+| `[colors]` | `engrave` | `#ffc107` | SVG colour for the engraved border fill |
+| `[colors]` | `text` | `#0000ff` | SVG colour for the engraved text paths |
+| `[dimensions]` | `border_width` | `0.8` | Width of the etched border frame (mm) |
+| `[dimensions]` | `text_margin` | `1.0` | Clearance between text block and border frame (mm) |
+| `[sheet]` | `width` | `300` | Default sheet width when omitted from CLI (mm) |
+| `[sheet]` | `height` | `200` | Default sheet height when omitted from CLI (mm) |
+| `[font]` | `name` | `Arial` | Font name used for text-to-path conversion |
+
+---
+
 ## Project Structure
 
 ```
 lamicoid-generator/
-├── generator.py   # Main script — data structures, solvers, SVG renderer, CLI
-├── INPUT.csv      # Example label definitions
-└── arial.ttf      # Optional: place a TrueType font here for text rendering
+├── generator.py       # Main script — data structures, solvers, SVG renderer, CLI
+├── generator.conf     # Optional configuration file (colours, dimensions, font)
+├── requirements.txt   # Pip dependencies (svgwrite, fonttools)
+├── test_generator.py  # Unit tests
+├── INPUT.csv          # Example label definitions
+└── arial.ttf          # Optional: place a TrueType font here for text rendering
 ```
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+Copyright (C) 2026  Lesco Design & Mfg. Co., Inc.
+
+GNU General Public License v3.0 — see [LICENSE](LICENSE) for details.
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
