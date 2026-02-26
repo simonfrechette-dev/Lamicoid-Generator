@@ -57,9 +57,18 @@ import configparser
 import csv
 import math
 import os
+import sys
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from collections import defaultdict
+
+# Ensure UTF-8 output on all platforms (avoids UnicodeEncodeError on Windows
+# when the console code page is not UTF-8, e.g. cp1252).
+import io
+if isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if isinstance(sys.stderr, io.TextIOWrapper):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 try:
     from ortools.sat.python import cp_model
@@ -388,10 +397,10 @@ class SimpleBinPacker:
         """
         Attempt to place a rectangle of given *width* × *height* on *sheet*.
 
-        Iterates over each X-column defined by the current skyline.  For
-        each candidate X the minimum Y that avoids all existing placements
-        is computed; if the rectangle fits within the sheet bounds and
-        passes an overlap check, a Placement is returned.
+        Evaluates all candidate positions from the skyline and selects the
+        one with the minimum effective Y (topmost available row), breaking
+        ties by minimum X.  This row-first strategy produces compact grid
+        layouts rather than tall columns.
 
         Parameters
         ----------
@@ -405,35 +414,48 @@ class SimpleBinPacker:
         -------
         Placement on success, None if no feasible position exists.
         """
-        
+
         # Build skyline from existing placements
         skyline = self._build_skyline(sheet)
-        
-        # Try to place at each skyline position
+
+        # Evaluate every candidate and pick the best (min y, then min x)
+        best_x: Optional[float] = None
+        best_y: Optional[float] = None
+
         for x, y_base in skyline:
-            # Check if fits
+            # Check if fits horizontally
             if x + width > sheet.width:
                 continue
-            
-            # Check vertical space
+
+            # Compute effective y (must clear all existing items in this X band)
             max_y = self._get_max_y_at_position(sheet, x, width)
             y = max(y_base, max_y)
-            
-            if y + height <= sheet.height:
-                # Check for overlaps
-                if not self._check_overlap(sheet, x, y, width, height):
-                    return Placement(label, x, y, rotation)
-        
+
+            if y + height > sheet.height:
+                continue
+
+            if self._check_overlap(sheet, x, y, width, height):
+                continue
+
+            # Keep the candidate with the lowest y, then leftmost x
+            if best_y is None or (y, x) < (best_y, best_x):
+                best_y = y
+                best_x = x
+
+        if best_x is not None and best_y is not None:
+            return Placement(label, best_x, best_y, rotation)
+
         return None
     
     def _build_skyline(self, sheet: Sheet) -> List[Tuple[float, float]]:
         """
         Build a simplified skyline from the current placements on *sheet*.
 
-        The skyline is represented as a sorted list of (x, y) knot points
-        where x is the right edge of each existing placement and y is
-        always 0 (the sheet top).  This is a coarse approximation that
-        lists column starts rather than a true stepped profile.
+        The candidate set includes the sheet origin, the right edge of each
+        placed item at its own row level (enabling row continuation), the
+        left edge at the bottom of each item (starting a new row), and the
+        right edge at y=0 (legacy column candidates).  Duplicates are
+        eliminated and the list is sorted.
 
         Parameters
         ----------
@@ -441,23 +463,29 @@ class SimpleBinPacker:
 
         Returns
         -------
-        Sorted, deduplicated list of (x, 0) knot points.  Returns
+        Sorted, deduplicated list of (x, y) candidate points.  Returns
         [(0, 0)] when the sheet is empty.
         """
         if not sheet.placements:
             return [(0.0, 0.0)]
-        
-        # Simple approach: check grid positions
-        skyline: List[Tuple[float, float]] = [(0.0, 0.0)]
-        
-        # Add positions after each placement
+
+        # Collect candidate (x, y) positions:
+        #   (0, 0)            — sheet origin
+        #   (right, y)        — immediately to the right of each item (same row)
+        #   (0, bottom)       — start of a new row below each item
+        #   (right, 0)        — right edge at top (original column candidates)
+        candidates: set = {(0.0, 0.0)}
+
         for p in sheet.placements:
-            w = p.label.width if p.rotation == 0 else p.label.height
-            skyline.append((p.x + w, 0.0))
-        
-        # Sort and deduplicate
-        skyline = sorted(set(skyline))
-        return skyline
+            pw = p.label.width  if p.rotation == 0 else p.label.height
+            ph = p.label.height if p.rotation == 0 else p.label.width
+            candidates.add((p.x + pw, p.y))          # same-row continuation
+            candidates.add((0.0,      p.y + ph))      # new row below this item
+            candidates.add((p.x + pw, 0.0))           # right-edge at top
+
+        # Sort to give _skyline_place a stable iteration order;
+        # best-placement selection is done inside _skyline_place itself.
+        return sorted(candidates)
     
     def _get_max_y_at_position(self, sheet: Sheet, x: float, width: float) -> float:
         """
@@ -556,7 +584,7 @@ class ILPBinPacker:
       - Hint        → warm-starts the CP-SAT search
     """
 
-    SCALE = 10  # 0.1 mm integer precision
+    SCALE = 100  # 0.01 mm integer precision (keeps quantisation gaps < merge tolerance)
 
     def __init__(self, sheet_width: float, sheet_height: float,
                  time_limit: int = 60) -> None:
@@ -810,19 +838,25 @@ class ILPBinPacker:
         sheet_used : List of BoolVar, one per candidate sheet.
         S          : Integer scale factor (mm → integer units).
         """
-        # Build a queue of (label_id, sheet_idx, x_mm, y_mm, rot) from FFD
+        # Build a queue of (sheet_idx, x_mm, y_mm, rot) from FFD.
+        # Store raw float mm so we can snap to the item's integer grid later
+        # (independent rounding of cumulative float coords causes phantom
+        # overlaps in integer space that make hints infeasible for CP-SAT).
         ffd_queue: Dict[int, list] = defaultdict(list)
         for k, sheet in enumerate(ffd_sheets):
             for p in sheet.placements:
                 ffd_queue[id(p.label)].append(
-                    (k, int(round(p.x * S)), int(round(p.y * S)), p.rotation)
+                    (k, p.x, p.y, p.rotation)      # raw floats, snapped below
                 )
+
+        W_units = int(round(self.sheet_width  * S))
+        H_units = int(round(self.sheet_height * S))
 
         for i, item in enumerate(items):
             lid = id(item['label'])
             if lid not in ffd_queue or not ffd_queue[lid]:
                 continue
-            k_hint, x_hint, y_hint, rot_hint = ffd_queue[lid].pop(0)
+            k_hint, x_mm, y_mm, rot_hint = ffd_queue[lid].pop(0)
 
             for oi, (w, h, rot) in enumerate(item['oris']):
                 is_hint = (rot == rot_hint)
@@ -830,6 +864,16 @@ class ILPBinPacker:
                 if key in a_var:
                     model.AddHint(a_var[key], 1 if is_hint else 0)
                     if is_hint:
+                        # Snap to nearest multiple of this item's integer
+                        # width/height to prevent cumulative rounding drift
+                        # from producing overlapping (infeasible) hints.
+                        x_hint = (int(round(x_mm * S / w)) * w
+                                  if w > 0 else int(round(x_mm * S)))
+                        y_hint = (int(round(y_mm * S / h)) * h
+                                  if h > 0 else int(round(y_mm * S)))
+                        # Clamp to valid domain
+                        x_hint = max(0, min(x_hint, W_units - w))
+                        y_hint = max(0, min(y_hint, H_units - h))
                         model.AddHint(x_var[key], x_hint)
                         model.AddHint(y_var[key], y_hint)
                 # All other sheets: hint inactive
@@ -926,7 +970,7 @@ def parse_csv(filename: str) -> List[Label]:
     """
     labels = []
 
-    with open(filename, 'r', encoding='utf-8') as f:
+    with open(filename, 'r', encoding='utf-8-sig') as f:
         # ── Auto-detect dialect ───────────────────────────────────────
         sample = f.read(4096)
         f.seek(0)

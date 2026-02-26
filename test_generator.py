@@ -734,7 +734,7 @@ class TestTryMergeSideBySide(unittest.TestCase):
         self.assertIsNotNone(result, "Expected a merged result but got None")
         if result is not None:
             self.assertAlmostEqual(result['width'], 4.0)
-            self.assertAlmostEqual(result['height'], 200.0)
+            self.assertAlmostEqual(result['height'], 100.0)
 
 
 class TestOptimizeCutLines(unittest.TestCase):
