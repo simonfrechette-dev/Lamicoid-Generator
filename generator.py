@@ -134,6 +134,7 @@ def load_config(conf_path: str = _CONF_FILE) -> configparser.ConfigParser:
         'text':         '#0000ff',
         'border_width': '0.8',
         'text_margin':  '1.0',
+        'attachment_tab_width': '0.0',
         'width':        '300',
         'height':       '200',
         'name':         'Arial',
@@ -152,6 +153,61 @@ def load_config(conf_path: str = _CONF_FILE) -> configparser.ConfigParser:
 
 
 CFG: configparser.ConfigParser = load_config()
+
+
+def print_current_config(cfg: configparser.ConfigParser = CFG) -> None:
+    """Print the effective configuration currently in use."""
+    print("CURRENT CONFIGURATION")
+    print("-" * 70)
+    print(f"Config file: {_CONF_FILE}")
+    print(f"File exists: {'yes' if os.path.exists(_CONF_FILE) else 'no (using defaults)'}")
+
+    ordered_keys = {
+        'colors':     ['cut', 'engrave', 'text'],
+        'dimensions': ['border_width', 'text_margin', 'attachment_tab_width'],
+        'sheet':      ['width', 'height'],
+        'font':       ['name'],
+    }
+
+    try:
+        import numpy as np
+        print("Format engine: NumPy")
+
+        for section in ('colors', 'dimensions', 'sheet', 'font'):
+            rows = []
+            explicit_section = cfg._sections.get(section, {})
+            for key in ordered_keys[section]:
+                value = cfg.get(section, key, fallback=cfg.get('DEFAULT', key, fallback=''))
+                source = section if key in explicit_section else 'DEFAULT'
+                rows.append((key, str(value), source))
+
+            table = np.array(rows, dtype=str)
+            widths = np.maximum(
+                np.char.str_len(np.array(['key', 'value', 'source'], dtype=str)),
+                np.char.str_len(table).max(axis=0)
+            )
+
+            print(f"\n[{section}]")
+            header = (
+                f"{('key').ljust(int(widths[0]))} | "
+                f"{('value').ljust(int(widths[1]))} | "
+                f"{('source').ljust(int(widths[2]))}"
+            )
+            print(header)
+            print("-" * len(header))
+            for key, value, source in table:
+                print(
+                    f"{key.ljust(int(widths[0]))} | "
+                    f"{value.ljust(int(widths[1]))} | "
+                    f"{source.ljust(int(widths[2]))}"
+                )
+    except ImportError:
+        print("Format engine: plain (NumPy not installed)")
+        for section in ('colors', 'dimensions', 'sheet', 'font'):
+            print(f"\n[{section}]")
+            for key in ordered_keys[section]:
+                value = cfg.get(section, key, fallback=cfg.get('DEFAULT', key, fallback=''))
+                print(f"{key} = {value}")
 
 # ============================================================================
 # DATA STRUCTURES
@@ -1107,7 +1163,9 @@ class SVGGenerator:
     can be located, otherwise falls back to placeholder rectangles.
     """
     
-    def __init__(self, sheet: Sheet, cfg: Optional[configparser.ConfigParser] = None) -> None:
+    def __init__(self, sheet: Sheet,
+                 cfg: Optional[configparser.ConfigParser] = None,
+                 attachment_tab_width: Optional[float] = None) -> None:
         """
         Prepare the generator for a specific sheet.
 
@@ -1123,6 +1181,11 @@ class SVGGenerator:
         self.COLOR_TEXT    = cfg.get('colors',     'text')
         self.BORDER_WIDTH  = cfg.getfloat('dimensions', 'border_width')
         self.TEXT_MARGIN   = cfg.getfloat('dimensions', 'text_margin')
+        configured_tab_w   = cfg.getfloat('dimensions', 'attachment_tab_width', fallback=0.0)
+        self.ATTACHMENT_TAB_WIDTH = (
+            configured_tab_w if attachment_tab_width is None
+            else max(0.0, attachment_tab_width)
+        )
         self._font_name    = cfg.get('font', 'name').strip()
         self.sheet = sheet
         self._init_font()
@@ -1251,9 +1314,14 @@ class SVGGenerator:
         print(f"     After:  {len(optimized_borders)} border rectangles, {len(optimized_cut_lines)} cut lines")
         print(f"     Text:   {len(all_text_paths)} text paths generated (one path per label)")
 
-        # Sort each group by coordinates (top-to-bottom, left-to-right)
+        # Sort each group by coordinates.
+        # In tab mode, reverse cut-line order to match requested opposite
+        # processing sequence versus the non-tab layout.
         optimized_borders.sort(key=lambda r: (r['y'], r['x']))
-        optimized_cut_lines.sort(key=lambda l: (min(l['y1'], l['y2']), min(l['x1'], l['x2'])))
+        optimized_cut_lines.sort(
+            key=lambda l: (min(l['y1'], l['y2']), min(l['x1'], l['x2'])),
+            reverse=self.ATTACHMENT_TAB_WIDTH > 0.0
+        )
         all_text_paths.sort(key=lambda tp: (tp.get('_sort_y', 0), tp.get('_sort_x', 0)))
 
         # Add cut lines group (back layer)
@@ -1300,6 +1368,7 @@ class SVGGenerator:
 <!-- Pieces: {len(self.sheet.placements)} -->
 <!-- Efficiency: {self.sheet.efficiency:.1f}% -->
 <!-- Text: Merged paths (one path per text line) -->
+<!-- Attachment tabs: {self.ATTACHMENT_TAB_WIDTH:.2f} mm per side -->
 """
         
         # Find position after XML declaration
@@ -1390,13 +1459,10 @@ class SVGGenerator:
         cut_lines = []
         text_paths = []
         
-        # Cut lines as true line segments (x1,y1 → x2,y2)
-        cut_lines.extend([
-            {'x1': x,         'y1': y,          'x2': x + width,  'y2': y,          'orientation': 'horizontal'},  # top
-            {'x1': x,         'y1': y + height, 'x2': x + width,  'y2': y + height, 'orientation': 'horizontal'},  # bottom
-            {'x1': x,         'y1': y,          'x2': x,          'y2': y + height, 'orientation': 'vertical'},    # left
-            {'x1': x + width, 'y1': y,          'x2': x + width,  'y2': y + height, 'orientation': 'vertical'},    # right
-        ])
+        # Cut lines as true line segments (x1,y1 → x2,y2).
+        # When attachment tabs are enabled, each side is split into two cuts
+        # leaving one centered uncut bridge per side.
+        cut_lines.extend(self._build_cut_lines(x, y, width, height))
         
         # Border rectangles
         borders.extend([
@@ -1434,6 +1500,88 @@ class SVGGenerator:
                 text_paths.extend(raw)
 
         return borders, cut_lines, text_paths
+
+    def _build_cut_lines(self, x: float, y: float,
+                         width: float, height: float) -> list:
+        """
+        Build per-label cut segments, optionally leaving one centered tab
+        (uncut bridge) on each side.
+
+        When ``ATTACHMENT_TAB_WIDTH`` is 0, each side is emitted as one
+        continuous line segment (legacy behavior). Otherwise each side is
+        split into up to two segments around the centered tab gap.
+        """
+        tab_width = max(0.0, self.ATTACHMENT_TAB_WIDTH)
+        if tab_width <= 0.0:
+            return [
+                {'x1': x,         'y1': y,          'x2': x + width,  'y2': y,          'orientation': 'horizontal'},
+                {'x1': x,         'y1': y + height, 'x2': x + width,  'y2': y + height, 'orientation': 'horizontal'},
+                {'x1': x,         'y1': y,          'x2': x,          'y2': y + height, 'orientation': 'vertical'},
+                {'x1': x + width, 'y1': y,          'x2': x + width,  'y2': y + height, 'orientation': 'vertical'},
+            ]
+
+        lines = []
+        lines.extend(self._split_horizontal_with_tab(x, x + width, y, tab_width))
+        lines.extend(self._split_horizontal_with_tab(x, x + width, y + height, tab_width))
+        lines.extend(self._split_vertical_with_tab(y, y + height, x, tab_width))
+        lines.extend(self._split_vertical_with_tab(y, y + height, x + width, tab_width))
+        return lines
+
+    def _split_horizontal_with_tab(self, x_start: float, x_end: float,
+                                   y: float, tab_width: float) -> list:
+        """Split a horizontal cut line into two segments around a centered tab."""
+        length = x_end - x_start
+        if length <= 0:
+            return []
+
+        center = (x_start + x_end) / 2.0
+        half_gap = min(tab_width / 2.0, length / 2.0)
+        left_end = center - half_gap
+        right_start = center + half_gap
+        min_seg = 1e-6
+
+        segments = []
+        if left_end - x_start > min_seg:
+            segments.append({
+                'x1': x_start, 'y1': y,
+                'x2': left_end, 'y2': y,
+                'orientation': 'horizontal'
+            })
+        if x_end - right_start > min_seg:
+            segments.append({
+                'x1': right_start, 'y1': y,
+                'x2': x_end, 'y2': y,
+                'orientation': 'horizontal'
+            })
+        return segments
+
+    def _split_vertical_with_tab(self, y_start: float, y_end: float,
+                                 x: float, tab_width: float) -> list:
+        """Split a vertical cut line into two segments around a centered tab."""
+        length = y_end - y_start
+        if length <= 0:
+            return []
+
+        center = (y_start + y_end) / 2.0
+        half_gap = min(tab_width / 2.0, length / 2.0)
+        top_end = center - half_gap
+        bottom_start = center + half_gap
+        min_seg = 1e-6
+
+        segments = []
+        if top_end - y_start > min_seg:
+            segments.append({
+                'x1': x, 'y1': y_start,
+                'x2': x, 'y2': top_end,
+                'orientation': 'vertical'
+            })
+        if y_end - bottom_start > min_seg:
+            segments.append({
+                'x1': x, 'y1': bottom_start,
+                'x2': x, 'y2': y_end,
+                'orientation': 'vertical'
+            })
+        return segments
     
     def _text_to_paths(self, text: str, x: float, y: float,
                        width: float, height: float,
@@ -2149,7 +2297,8 @@ class SVGGenerator:
 def generate_laser_sheets(csv_file: str, sheet_width: float, sheet_height: float,
                          output_prefix: str = "output/cutsheet",
                          solver: str = "ilp",
-                         time_limit: int = 60) -> List[str]:
+                         time_limit: int = 60,
+                         tab_width: Optional[float] = None) -> List[str]:
     """
     Full pipeline: parse CSV → bin-pack → emit SVG sheets.
 
@@ -2174,6 +2323,10 @@ def generate_laser_sheets(csv_file: str, sheet_width: float, sheet_height: float
     time_limit : int, optional
         CP-SAT wall-clock time limit in seconds per material group
         (ILP solver only, default 60).
+    tab_width : float, optional
+        Attachment-tab width in mm. One centered tab is kept uncut on each
+        side of every label. ``None`` uses ``generator.conf`` value;
+        ``0`` disables tabs.
 
     Returns
     -------
@@ -2186,6 +2339,15 @@ def generate_laser_sheets(csv_file: str, sheet_width: float, sheet_height: float
     print("=" * 70)
     print(f"\nReading labels from: {csv_file}")
     print(f"Stock sheet size: {sheet_width} x {sheet_height} mm")
+    resolved_tab_width = CFG.getfloat('dimensions', 'attachment_tab_width', fallback=0.0)
+    if tab_width is not None:
+        resolved_tab_width = tab_width
+    if resolved_tab_width < 0:
+        raise ValueError("Attachment tab width must be >= 0 mm")
+    if resolved_tab_width > 0:
+        print(f"Attachment tabs: enabled ({resolved_tab_width:.2f} mm per side)")
+    else:
+        print("Attachment tabs: disabled")
     print()
 
     labels = parse_csv(csv_file)
@@ -2244,7 +2406,7 @@ def generate_laser_sheets(csv_file: str, sheet_width: float, sheet_height: float
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
 
-        generator = SVGGenerator(sheet)
+        generator = SVGGenerator(sheet, attachment_tab_width=resolved_tab_width)
         svg_content = generator.generate()
 
         with open(filename, 'w', encoding='utf-8') as f:
@@ -2292,6 +2454,8 @@ Examples:
   python generator.py INPUT.csv 800 600 -o project_name
   python generator.py INPUT.csv 300 200 --solver ffd           # fast heuristic
   python generator.py INPUT.csv 300 200 --time-limit 120       # 2-min ILP limit
+    python generator.py INPUT.csv 300 200 --tab-width 2.0        # keep tabs
+    python generator.py --print-config                           # show active config
 
 Requires for ILP solver:  pip install ortools
 Requires for SVG output:  pip install svgwrite fonttools
@@ -2309,7 +2473,7 @@ Output SVG layers:
     _default_w = CFG.getfloat('sheet', 'width')
     _default_h = CFG.getfloat('sheet', 'height')
 
-    parser.add_argument("csv_file", help="Input CSV file path")
+    parser.add_argument("csv_file", nargs='?', help="Input CSV file path")
     parser.add_argument("width",  type=float, nargs='?', default=_default_w,
                         help=f"Sheet width in mm (default from config: {_default_w})")
     parser.add_argument("height", type=float, nargs='?', default=_default_h,
@@ -2325,12 +2489,28 @@ Output SVG layers:
                         metavar="SECONDS",
                         help="CP-SAT wall-clock time limit per material group "
                              "(default: 60s, ILP only)")
+    parser.add_argument("--tab-width", type=float, default=None,
+                        metavar="MM",
+                        help="Attachment-tab width in mm (one centered tab per "
+                            "label side). Overrides config; 0 disables tabs.")
+    parser.add_argument("--print-config", action="store_true",
+                        help="Print the current effective configuration and exit "
+                             "(unless an input CSV is also provided).")
 
     args = parser.parse_args()
 
+    if args.print_config:
+        print_current_config(CFG)
+        if not args.csv_file:
+            exit(0)
+
+    if not args.csv_file:
+        parser.error("the following arguments are required: csv_file")
+
     try:
         generate_laser_sheets(args.csv_file, args.width, args.height,
-                              args.output, args.solver, args.time_limit)
+                              args.output, args.solver, args.time_limit,
+                              args.tab_width)
     except FileNotFoundError:
         print(f"\n❌ Error: File '{args.csv_file}' not found")
         exit(1)

@@ -171,6 +171,8 @@ python generator.py INPUT.csv [SHEET_WIDTH [SHEET_HEIGHT]] [options]
 | `-o`, `--output PREFIX` | `output/cutsheet` | Output path prefix, including optional directory (created automatically) |
 | `--solver {ilp,ffd}` | `ilp` | Solver: `ilp` = OR-Tools CP-SAT (optimal), `ffd` = First-Fit Decreasing (fast) |
 | `--time-limit SECONDS` | `60` | CP-SAT time limit per material group (ILP only) |
+| `--tab-width MM` | from config (`0.0`) | Keep one centered uncut attachment tab on each side of every label; `0` disables |
+| `--print-config` | off | Print the current effective configuration (from `generator.conf` + defaults) |
 
 ### Examples
 
@@ -189,6 +191,12 @@ python generator.py INPUT.csv --solver ffd
 
 # Allow 2 minutes for the ILP solver per material group
 python generator.py INPUT.csv 300 200 --time-limit 120
+
+# Keep 2 mm attachment tabs (one per side)
+python generator.py INPUT.csv 300 200 --tab-width 2.0
+
+# Print active configuration
+python generator.py --print-config
 ```
 
 Output SVG files are named `<prefix>_<material>_<sheet_number>.svg`, e.g. `output/cutsheet_ABS_WHITE_1.svg`.  The output directory is created automatically if it does not exist.
@@ -265,6 +273,7 @@ All tuneable parameters live in `generator.conf` (INI format) next to the script
 | `[colors]` | `text` | `#0000ff` | SVG colour for the engraved text paths |
 | `[dimensions]` | `border_width` | `0.8` | Width of the etched border frame (mm) |
 | `[dimensions]` | `text_margin` | `1.0` | Clearance between text block and border frame (mm) |
+| `[dimensions]` | `attachment_tab_width` | `0.0` | Uncut tab width kept at the center of each label side (mm); `0` disables |
 | `[sheet]` | `width` | `300` | Default sheet width when omitted from CLI (mm) |
 | `[sheet]` | `height` | `200` | Default sheet height when omitted from CLI (mm) |
 | `[font]` | `name` | `Arial` | Font name used for text-to-path conversion |

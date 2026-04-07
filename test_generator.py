@@ -37,6 +37,7 @@ import os
 import re
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 
 # ---------------------------------------------------------------------------
 # Import module under test (suppress config-load print)
@@ -55,6 +56,7 @@ with contextlib.redirect_stdout(io.StringIO()):
         generate_laser_sheets,
         load_config,
         parse_csv,
+        print_current_config,
     )
 
 
@@ -76,6 +78,7 @@ def _minimal_cfg() -> configparser.ConfigParser:
     cfg = configparser.ConfigParser(defaults={
         'cut': '#f44336', 'engrave': '#ffc107', 'text': '#0000ff',
         'border_width': '0.8', 'text_margin': '1.0',
+        'attachment_tab_width': '0.0',
         'width': '300', 'height': '200', 'name': 'Arial',
     })
     for section in ('colors', 'dimensions', 'sheet', 'font'):
@@ -540,6 +543,44 @@ class TestSVGGeneratorStructure(unittest.TestCase):
             group_content = text_group_match.group(1).strip()
             self.assertNotIn('<path', group_content)
 
+    def test_tabbed_cut_lines_use_opposite_group_order(self):
+        label = _make_label(w=50, h=30, text="X")
+        sheet = _make_sheet(placements=[Placement(label, 0, 0)])
+
+        cfg_no_tabs = _minimal_cfg()
+        cfg_no_tabs.set('dimensions', 'attachment_tab_width', '0.0')
+        with contextlib.redirect_stdout(io.StringIO()):
+            svg_no_tabs = SVGGenerator(sheet, cfg_no_tabs).generate()
+
+        cfg_tabs = _minimal_cfg()
+        cfg_tabs.set('dimensions', 'attachment_tab_width', '6.0')
+        with contextlib.redirect_stdout(io.StringIO()):
+            svg_tabs = SVGGenerator(sheet, cfg_tabs).generate()
+
+        ns = {'svg': 'http://www.w3.org/2000/svg'}
+        no_tabs_root = ET.fromstring(svg_no_tabs)
+        tabs_root = ET.fromstring(svg_tabs)
+
+        no_tabs_cut_group = no_tabs_root.find(".//svg:g[@id='cut_lines']", ns)
+        tabs_cut_group = tabs_root.find(".//svg:g[@id='cut_lines']", ns)
+
+        self.assertIsNotNone(no_tabs_cut_group)
+        self.assertIsNotNone(tabs_cut_group)
+
+        no_tabs_lines = list(no_tabs_cut_group)
+        tabs_lines = list(tabs_cut_group)
+
+        self.assertGreater(len(no_tabs_lines), 0)
+        self.assertGreater(len(tabs_lines), 0)
+
+        first_no_tabs = float(no_tabs_lines[0].attrib['y1'])
+        first_tabs = float(tabs_lines[0].attrib['y1'])
+
+        # No tabs: top-to-bottom ordering starts at y=0.
+        self.assertAlmostEqual(first_no_tabs, 0.0)
+        # Tabs enabled: opposite order starts from the largest y first.
+        self.assertGreater(first_tabs, 0.0)
+
 
 class TestSVGGeneratorExtractPlacement(unittest.TestCase):
 
@@ -565,6 +606,29 @@ class TestSVGGeneratorExtractPlacement(unittest.TestCase):
         p = Placement(label, 0, 0, 0)
         _, cuts, _ = self.gen._extract_placement_elements(p, 0)
         self.assertEqual(len(cuts), 4)
+
+    def test_attachment_tabs_split_cut_lines(self):
+        cfg = _minimal_cfg()
+        cfg.set('dimensions', 'attachment_tab_width', '6.0')
+        label = _make_label(w=50, h=30)
+        p = Placement(label, 0, 0, 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gen = SVGGenerator(_make_sheet(), cfg)
+        _, cuts, _ = gen._extract_placement_elements(p, 0)
+        # 2 cut segments per side => 8 total
+        self.assertEqual(len(cuts), 8)
+
+        # Top side should keep a centered 6 mm tab: [0..22] and [28..50]
+        top_cuts = sorted(
+            [c for c in cuts if c['orientation'] == 'horizontal'
+             and abs(c['y1']) < 1e-6 and abs(c['y2']) < 1e-6],
+            key=lambda c: c['x1']
+        )
+        self.assertEqual(len(top_cuts), 2)
+        self.assertAlmostEqual(top_cuts[0]['x1'], 0.0)
+        self.assertAlmostEqual(top_cuts[0]['x2'], 22.0)
+        self.assertAlmostEqual(top_cuts[1]['x1'], 28.0)
+        self.assertAlmostEqual(top_cuts[1]['x2'], 50.0)
 
     def test_cut_lines_have_correct_keys(self):
         label = _make_label(w=50, h=30)
@@ -864,6 +928,7 @@ class TestLoadConfig(unittest.TestCase):
         self.assertEqual(cfg.get('DEFAULT', 'engrave'), '#ffc107')
         self.assertEqual(cfg.get('DEFAULT', 'text'), '#0000ff')
         self.assertAlmostEqual(cfg.getfloat('DEFAULT', 'border_width'), 0.8)
+        self.assertAlmostEqual(cfg.getfloat('DEFAULT', 'attachment_tab_width'), 0.0)
 
     def test_all_required_sections_created(self):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -879,6 +944,16 @@ class TestLoadConfig(unittest.TestCase):
             cfg = load_config(real_conf)
         # Config file loaded: sections present
         self.assertTrue(cfg.has_section('colors') or cfg.has_section('sheet'))
+
+    def test_print_current_config_contains_expected_keys(self):
+        cfg = _minimal_cfg()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_current_config(cfg)
+        out = buf.getvalue()
+        self.assertIn('CURRENT CONFIGURATION', out)
+        self.assertIn('[dimensions]', out)
+        self.assertIn('attachment_tab_width', out)
 
 
 # ============================================================================
