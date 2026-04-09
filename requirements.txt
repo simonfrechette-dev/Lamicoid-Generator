@@ -5,3 +5,7 @@ fonttools>=4.0.0
 # Optional: OR-Tools CP-SAT solver for optimal bin packing
 # Falls back to First-Fit Decreasing heuristic if not installed
 # ortools>=9.0
+
+# Optional: NumPy for prettier --print-config table formatting
+# Falls back to plain text formatting if not installed
+# numpy>=1.24

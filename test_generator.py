@@ -311,6 +311,29 @@ class TestSimpleBinPackerPack(unittest.TestCase):
                         overlap,
                         f"Placements {i} and {j} overlap on sheet")
 
+    def test_item_spacing_enforced_when_set(self):
+        spacing = 2.0
+        packer = SimpleBinPacker(300, 200, item_spacing=spacing)
+        labels = [_make_label(w=50, h=30, qty=10)]
+        sheets = packer.pack(labels)
+
+        for sheet in sheets:
+            for i, pi in enumerate(sheet.placements):
+                wi = pi.label.width if pi.rotation == 0 else pi.label.height
+                hi = pi.label.height if pi.rotation == 0 else pi.label.width
+                for j, pj in enumerate(sheet.placements):
+                    if i >= j:
+                        continue
+                    wj = pj.label.width if pj.rotation == 0 else pj.label.height
+                    hj = pj.label.height if pj.rotation == 0 else pj.label.width
+
+                    gap_x = max(0.0, max(pi.x - (pj.x + wj), pj.x - (pi.x + wi)))
+                    gap_y = max(0.0, max(pi.y - (pj.y + hj), pj.y - (pi.y + hi)))
+                    self.assertTrue(
+                        gap_x + 1e-9 >= spacing or gap_y + 1e-9 >= spacing,
+                        f"Placements {i} and {j} violate spacing {spacing}mm"
+                    )
+
 
 # ============================================================================
 # 3. ILPBinPacker tests
@@ -368,6 +391,30 @@ class TestILPBinPackerFallback(unittest.TestCase):
                         pi.y + hi <= pj.y or pj.y + hj <= pi.y
                     )
                     self.assertFalse(overlap, f"ILP placements {i} and {j} overlap")
+
+    def test_item_spacing_enforced_when_set(self):
+        spacing = 2.0
+        labels = [_make_label(w=60, h=40, qty=8)]
+        packer = ILPBinPacker(300, 200, time_limit=15, item_spacing=spacing)
+        with contextlib.redirect_stdout(io.StringIO()):
+            sheets = packer.pack(labels)
+
+        for sheet in sheets:
+            for i, pi in enumerate(sheet.placements):
+                wi = pi.label.width if pi.rotation == 0 else pi.label.height
+                hi = pi.label.height if pi.rotation == 0 else pi.label.width
+                for j, pj in enumerate(sheet.placements):
+                    if i >= j:
+                        continue
+                    wj = pj.label.width if pj.rotation == 0 else pj.label.height
+                    hj = pj.label.height if pj.rotation == 0 else pj.label.width
+
+                    gap_x = max(0.0, max(pi.x - (pj.x + wj), pj.x - (pi.x + wi)))
+                    gap_y = max(0.0, max(pi.y - (pj.y + hj), pj.y - (pi.y + hi)))
+                    self.assertTrue(
+                        gap_x + 1e-9 >= spacing or gap_y + 1e-9 >= spacing,
+                        f"ILP placements {i} and {j} violate spacing {spacing}mm"
+                    )
 
 
 # ============================================================================

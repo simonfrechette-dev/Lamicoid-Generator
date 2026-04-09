@@ -314,7 +314,8 @@ class SimpleBinPacker:
     No external dependencies required.
     """
 
-    def __init__(self, sheet_width: float, sheet_height: float) -> None:
+    def __init__(self, sheet_width: float, sheet_height: float,
+                 item_spacing: float = 0.0) -> None:
         """
         Initialise the packer with fixed sheet dimensions.
 
@@ -322,9 +323,11 @@ class SimpleBinPacker:
         ----------
         sheet_width  : Available sheet width in mm.
         sheet_height : Available sheet height in mm.
+        item_spacing : Minimum spacing between labels in mm.
         """
         self.sheet_width  = sheet_width
         self.sheet_height = sheet_height
+        self.item_spacing = max(0.0, item_spacing)
         
     def pack(self, labels: List[Label]) -> List[Sheet]:
         """
@@ -535,9 +538,11 @@ class SimpleBinPacker:
         for p in sheet.placements:
             pw = p.label.width  if p.rotation == 0 else p.label.height
             ph = p.label.height if p.rotation == 0 else p.label.width
-            candidates.add((p.x + pw, p.y))          # same-row continuation
-            candidates.add((0.0,      p.y + ph))      # new row below this item
-            candidates.add((p.x + pw, 0.0))           # right-edge at top
+            right = p.x + pw + self.item_spacing
+            bottom = p.y + ph + self.item_spacing
+            candidates.add((right, p.y))               # same-row continuation
+            candidates.add((0.0,  bottom))             # new row below this item
+            candidates.add((right, 0.0))               # right-edge at top
 
         # Sort to give _skyline_place a stable iteration order;
         # best-placement selection is done inside _skyline_place itself.
@@ -568,8 +573,8 @@ class SimpleBinPacker:
             ph = p.label.height if p.rotation == 0 else p.label.width
             
             # Check if this placement overlaps X range
-            if not (p.x + pw <= x or p.x >= x + width):
-                max_y = max(max_y, p.y + ph)
+            if not (p.x + pw + self.item_spacing <= x or p.x >= x + width + self.item_spacing):
+                max_y = max(max_y, p.y + ph + self.item_spacing)
         
         return max_y
     
@@ -600,8 +605,8 @@ class SimpleBinPacker:
             ph = p.label.height if p.rotation == 0 else p.label.width
             
             # Check rectangle intersection
-            if not (x + width <= p.x or x >= p.x + pw or
-                   y + height <= p.y or y >= p.y + ph):
+            if not (x + width + self.item_spacing <= p.x or x >= p.x + pw + self.item_spacing or
+                    y + height + self.item_spacing <= p.y or y >= p.y + ph + self.item_spacing):
                 return True
         
         return False
@@ -643,7 +648,7 @@ class ILPBinPacker:
     SCALE = 100  # 0.01 mm integer precision (keeps quantisation gaps < merge tolerance)
 
     def __init__(self, sheet_width: float, sheet_height: float,
-                 time_limit: int = 60) -> None:
+                 time_limit: int = 60, item_spacing: float = 0.0) -> None:
         """
         Initialise the ILP packer.
 
@@ -659,6 +664,7 @@ class ILPBinPacker:
         self.sheet_width  = sheet_width
         self.sheet_height = sheet_height
         self.time_limit   = time_limit
+        self.item_spacing = max(0.0, item_spacing)
 
     def pack(self, labels: List[Label]) -> List[Sheet]:
         """
@@ -712,7 +718,8 @@ class ILPBinPacker:
         except ImportError:
             print("  ⚠️  OR-Tools not installed.  pip install ortools")
             print("  ↩  Falling back to FFD heuristic")
-            return SimpleBinPacker(self.sheet_width, self.sheet_height) \
+            return SimpleBinPacker(self.sheet_width, self.sheet_height,
+                                   item_spacing=self.item_spacing) \
                        ._pack_material(labels, material)
         return self._solve_cp_sat(labels, material)
 
@@ -747,7 +754,8 @@ class ILPBinPacker:
         """
         if cp_model is None:
             print("  ⚠️  OR-Tools not available.  Falling back to FFD heuristic")
-            return SimpleBinPacker(self.sheet_width, self.sheet_height) \
+            return SimpleBinPacker(self.sheet_width, self.sheet_height,
+                                   item_spacing=self.item_spacing) \
                        ._pack_material(labels, material)
         
         # Import here to narrow the type for type checkers
@@ -756,6 +764,7 @@ class ILPBinPacker:
         S = self.SCALE
         W = int(round(self.sheet_width  * S))
         H = int(round(self.sheet_height * S))
+        spacing_units = int(round(self.item_spacing * S))
 
         # ── Prepare item data ──────────────────────────────────────────
         # items[i] = {'label': Label, 'oris': [(w_int, h_int, rot_deg), ...]}
@@ -764,10 +773,17 @@ class ILPBinPacker:
             w0 = int(round(label.width  * S))
             h0 = int(round(label.height * S))
             oris = []
-            if w0 <= W and h0 <= H:
-                oris.append((w0, h0, 0))
-            if w0 != h0 and h0 <= W and w0 <= H:
-                oris.append((h0, w0, 90))
+            # Apply spacing in the packing footprint (not in rendered geometry)
+            # so labels keep a minimum clearance while preserving true cut size.
+            w_pack0 = w0 + spacing_units
+            h_pack0 = h0 + spacing_units
+            if w_pack0 <= W and h_pack0 <= H:
+                oris.append((w_pack0, h_pack0, 0, w0, h0))
+            if w0 != h0:
+                w_pack90 = h0 + spacing_units
+                h_pack90 = w0 + spacing_units
+                if w_pack90 <= W and h_pack90 <= H:
+                    oris.append((w_pack90, h_pack90, 90, h0, w0))
             if not oris:
                 print(f"  ⚠️  Label {label.width}×{label.height} mm "
                       f"doesn't fit — skipped")
@@ -780,10 +796,17 @@ class ILPBinPacker:
         n = len(items)
 
         # ── FFD upper bound & warm-start hint ─────────────────────────
-        ffd = SimpleBinPacker(self.sheet_width, self.sheet_height)
+        ffd = SimpleBinPacker(self.sheet_width, self.sheet_height,
+                      item_spacing=self.item_spacing)
         ffd_sheets = ffd._pack_material(labels, material)
         ub = len(ffd_sheets)
         print(f"  → FFD upper bound: {ub} sheet(s)")
+
+        # If FFD already fits everything onto one sheet, CP-SAT cannot
+        # improve sheet count; keep the compact deterministic FFD layout.
+        if ub <= 1:
+            print("  → FFD already fits in one sheet — using FFD layout")
+            return ffd_sheets
 
         # ── Build CP-SAT model ────────────────────────────────────────
         model = cp_model_module.CpModel()
@@ -799,14 +822,14 @@ class ILPBinPacker:
 
         for i, item in enumerate(items):
             for k in range(ub):
-                for oi, (w, h, _) in enumerate(item['oris']):
+                for oi, (w_pack, h_pack, _, _, _) in enumerate(item['oris']):
                     key = (i, k, oi)
                     a = model.new_bool_var(f'a_{i}_{k}_{oi}')
-                    x = model.new_int_var(0, W - w, f'x_{i}_{k}_{oi}')
-                    y = model.new_int_var(0, H - h, f'y_{i}_{k}_{oi}')
-                    xi = model.new_optional_interval_var(x, w, x + w, a,
+                    x = model.new_int_var(0, W - w_pack, f'x_{i}_{k}_{oi}')
+                    y = model.new_int_var(0, H - h_pack, f'y_{i}_{k}_{oi}')
+                    xi = model.new_optional_interval_var(x, w_pack, x + w_pack, a,
                                                         f'xi_{i}_{k}_{oi}')
-                    yi = model.new_optional_interval_var(y, h, y + h, a,
+                    yi = model.new_optional_interval_var(y, h_pack, y + h_pack, a,
                                                         f'yi_{i}_{k}_{oi}')
                     a_var[key] = a
                     x_var[key] = x
@@ -914,7 +937,7 @@ class ILPBinPacker:
                 continue
             k_hint, x_mm, y_mm, rot_hint = ffd_queue[lid].pop(0)
 
-            for oi, (w, h, rot) in enumerate(item['oris']):
+            for oi, (w_pack, h_pack, rot, _, _) in enumerate(item['oris']):
                 is_hint = (rot == rot_hint)
                 key = (i, k_hint, oi)
                 if key in a_var:
@@ -923,13 +946,13 @@ class ILPBinPacker:
                         # Snap to nearest multiple of this item's integer
                         # width/height to prevent cumulative rounding drift
                         # from producing overlapping (infeasible) hints.
-                        x_hint = (int(round(x_mm * S / w)) * w
-                                  if w > 0 else int(round(x_mm * S)))
-                        y_hint = (int(round(y_mm * S / h)) * h
-                                  if h > 0 else int(round(y_mm * S)))
+                        x_hint = (int(round(x_mm * S / w_pack)) * w_pack
+                                  if w_pack > 0 else int(round(x_mm * S)))
+                        y_hint = (int(round(y_mm * S / h_pack)) * h_pack
+                                  if h_pack > 0 else int(round(y_mm * S)))
                         # Clamp to valid domain
-                        x_hint = max(0, min(x_hint, W_units - w))
-                        y_hint = max(0, min(y_hint, H_units - h))
+                        x_hint = max(0, min(x_hint, W_units - w_pack))
+                        y_hint = max(0, min(y_hint, H_units - h_pack))
                         model.AddHint(x_var[key], x_hint)
                         model.AddHint(y_var[key], y_hint)
                 # All other sheets: hint inactive
@@ -972,7 +995,7 @@ class ILPBinPacker:
         for k in range(ub):
             placements: List[Placement] = []
             for i, item in enumerate(items):
-                for oi, (w, h, rot) in enumerate(item['oris']):
+                for oi, (_, _, rot, _, _) in enumerate(item['oris']):
                     key = (i, k, oi)
                     if key in a_var and solver.Value(a_var[key]):
                         x_mm = solver.Value(x_var[key]) / S
@@ -2370,10 +2393,13 @@ def generate_laser_sheets(csv_file: str, sheet_width: float, sheet_height: float
     if solver == "ilp":
         print("Algorithm: ILP — OR-Tools CP-SAT (exact 2-D bin packing)")
         print(f"Time limit: {time_limit}s per material group")
-        packer = ILPBinPacker(sheet_width, sheet_height, time_limit=time_limit)
+        packer = ILPBinPacker(sheet_width, sheet_height,
+                             time_limit=time_limit,
+                             item_spacing=resolved_tab_width)
     else:
         print("Algorithm: FFD — First-Fit Decreasing heuristic (skyline strategy)")
-        packer = SimpleBinPacker(sheet_width, sheet_height)
+        packer = SimpleBinPacker(sheet_width, sheet_height,
+                                 item_spacing=resolved_tab_width)
     print()
 
     sheets = packer.pack(labels)
